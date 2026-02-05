@@ -1,4 +1,4 @@
-name: CN video -> EN dubbed video (artifact)
+name: CN video -> EN dubbed video (voice clone, artifact)
 
 on:
   workflow_dispatch:
@@ -10,10 +10,14 @@ on:
         description: "Whisper model: tiny/base/small/medium/large"
         required: false
         default: "small"
-      tts_voice:
-        description: "edge-tts voice (e.g., en-US-JennyNeural)"
+      tts_ref_seconds:
+        description: "Seconds used as voice reference (>=6 recommended)"
         required: false
-        default: "en-US-JennyNeural"
+        default: "12"
+      tts_voice_clone_lang:
+        description: "Target language for cloned speech"
+        required: false
+        default: "en"
       retention_days:
         description: "Artifact retention days (1-90)"
         required: false
@@ -25,13 +29,13 @@ permissions:
 jobs:
   dub:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (JS runtime for yt-dlp EJS)
+      - name: Setup Node (yt-dlp JS runtime)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -49,8 +53,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # yt-dlp-ejs is required for full YouTube support in newer yt-dlp setups
-          pip install yt-dlp yt-dlp-ejs openai-whisper edge-tts
+          # yt-dlp + ejs for YouTube, whisper for translate, TTS for XTTS v2 voice cloning
+          pip install yt-dlp yt-dlp-ejs openai-whisper TTS
 
       - name: Prepare workspace
         run: |
@@ -79,18 +83,14 @@ jobs:
         run: |
           set -euo pipefail
           EXTRA_ARGS=()
-
-          # Cookies for "Sign in to confirm you're not a bot"
           if [ -f cookies.txt ]; then
             EXTRA_ARGS+=(--cookies cookies.txt)
           fi
-
-          # Use node runtime and allow fetching the EJS solver script from GitHub (recommended by yt-dlp warnings)
           EXTRA_ARGS+=(--js-runtimes node)
           EXTRA_ARGS+=(--remote-components ejs:github)
 
-          # More forgiving format selector to avoid "Requested format is not available"
-          FORMAT_SELECTOR="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+          # Prefer H.264 in MP4 when available, fallback to best MP4
+          FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
           yt-dlp \
             "${EXTRA_ARGS[@]}" \
@@ -101,71 +101,100 @@ jobs:
             "$VIDEO_URL"
 
           ls -lah out
-          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          echo "Video: $VIDEO_FILE"
 
-      - name: Extract audio (16k mono wav)
+      - name: Extract full audio for Whisper (16k mono wav)
         shell: bash
         run: |
           set -euo pipefail
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/audio.wav
+          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/audio_whisper.wav
 
-      - name: Whisper translate to English (txt)
+      - name: Make voice reference wav (for cloning)
+        shell: bash
+        env:
+          REF_SEC: ${{ inputs.tts_ref_seconds }}
+        run: |
+          set -euo pipefail
+          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
+          # Take a short slice after 1s to avoid leading silence; 24kHz mono is fine for XTTS
+          ffmpeg -y -ss 1 -t "$REF_SEC" -i "$VIDEO_FILE" -vn -ac 1 -ar 24000 -c:a pcm_s16le out/ref.wav
+
+      - name: Whisper translate to English text (txt)
         shell: bash
         env:
           WHISPER_MODEL: ${{ inputs.whisper_model }}
         run: |
           set -euo pipefail
-          whisper out/audio.wav \
+          whisper out/audio_whisper.wav \
             --model "$WHISPER_MODEL" \
             --task translate \
             --language Chinese \
             --output_dir out \
             --output_format txt
 
-      - name: TTS English dubbing (edge-tts -> mp3)
+          test -s out/audio_whisper.txt
+
+      - name: XTTS v2 voice-clone English audio (wav)
         shell: bash
         env:
-          TTS_VOICE: ${{ inputs.tts_voice }}
+          TARGET_LANG: ${{ inputs.tts_voice_clone_lang }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import asyncio, pathlib, os
-          import edge_tts
+          import os
+          from pathlib import Path
+          from TTS.api import TTS
 
-          voice = os.environ["TTS_VOICE"]
-          text = pathlib.Path("out/audio.txt").read_text(encoding="utf-8").strip()
+          text = Path("out/audio_whisper.txt").read_text(encoding="utf-8").strip()
           if not text:
-            raise SystemExit("Empty transcript; aborting")
+              raise SystemExit("Empty transcript")
 
-          async def run():
-            communicate = edge_tts.Communicate(text=text, voice=voice)
-            await communicate.save("out/en.mp3")
+          # XTTS v2: cross-language voice cloning via speaker_wav
+          tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
 
-          asyncio.run(run())
+          tts.tts_to_file(
+              text=text,
+              speaker_wav="out/ref.wav",
+              language=os.environ.get("TARGET_LANG", "en"),
+              file_path="out/en_cloned.wav",
+              split_sentences=True,
+          )
+          print("Generated out/en_cloned.wav")
           PY
 
-      - name: Mux English audio into video (output_en.mp4)
+      - name: Mux back into MP4 (Windows compatible)
         shell: bash
         run: |
           set -euo pipefail
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
+
+          # Always re-encode video to H.264 for Windows stock player compatibility
           ffmpeg -y \
-            -i "$VIDEO_FILE" -i out/en.mp3 \
+            -i "$VIDEO_FILE" -i out/en_cloned.wav \
             -map 0:v:0 -map 1:a:0 \
-            -c:v copy -c:a aac -shortest \
+            -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k \
+            -shortest -movflags +faststart \
             out/output_en.mp4
 
-      - name: Also export English audio as WAV
+      - name: Cleanup (keep only input.mp4 and output_en.mp4)
         shell: bash
         run: |
           set -euo pipefail
-          ffmpeg -y -i out/en.mp3 out/en.wav
+          # Normalize original name to input.mp4 (in case it isn't)
+          IN="$(ls -1 out/input.* | head -n 1)"
+          if [ "$IN" != "out/input.mp4" ]; then
+            mv "$IN" out/input.mp4
+          fi
+          # Remove everything else
+          find out -type f ! -name "input.mp4" ! -name "output_en.mp4" -delete
+          ls -lah out
 
-      - name: Upload artifact
+      - name: Upload artifact (only the two videos)
         uses: actions/upload-artifact@v4
         with:
           name: en-dubbed-output
-          path: out/
+          path: |
+            out/input.mp4
+            out/output_en.mp4
           retention-days: ${{ inputs.retention_days }}
