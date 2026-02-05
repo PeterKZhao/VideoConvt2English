@@ -9,7 +9,7 @@ on:
       agree_cpml:
         description: "Type 'yes' to agree to Coqui CPML (non-commercial only)"
         required: true
-        default: "no"
+        default: "yes"
       whisper_model:
         description: "Whisper model: tiny/base/small/medium/large"
         required: false
@@ -30,11 +30,6 @@ jobs:
   dub:
     runs-on: ubuntu-latest
     timeout-minutes: 240
-
-    # Make Coqui cache controllable + non-interactive TOS acceptance (you still gate it with agree_cpml)
-    env:
-      COQUI_TOS_AGREED: "1"
-      TTS_HOME: ${{ runner.temp }}/coqui-tts-home
 
     steps:
       - name: Check CPML agreement
@@ -67,9 +62,18 @@ jobs:
           pip install yt-dlp yt-dlp-ejs openai-whisper TTS
 
       - name: Prepare workspace
+        shell: bash
         run: |
+          set -euo pipefail
           rm -rf out
           mkdir -p out
+
+      - name: Set TTS_HOME (Coqui cache dir)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TTS_HOME=$RUNNER_TEMP/coqui-tts-home" >> "$GITHUB_ENV"
+          echo "COQUI_TOS_AGREED=1" >> "$GITHUB_ENV"
 
       - name: Write cookies.txt (optional)
         shell: bash
@@ -156,10 +160,10 @@ jobs:
               raise SystemExit("Empty transcript")
 
           tts_home = os.environ.get("TTS_HOME")
-          assert tts_home, "TTS_HOME not set"
+          if not tts_home:
+              raise SystemExit("TTS_HOME not set")
 
           def wipe_cache():
-              # wipe whole cache to recover from corrupted downloads (e.g., HTML/empty config.json)
               shutil.rmtree(tts_home, ignore_errors=True)
 
           for attempt in (1, 2):
