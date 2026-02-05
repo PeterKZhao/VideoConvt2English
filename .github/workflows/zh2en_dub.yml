@@ -4,51 +4,169 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Video URL to download"
+        description: "Video URL to download (e.g., YouTube)"
         required: true
       whisper_model:
-        description: "Whisper model (tiny/base/small/medium/large)"
+        description: "Whisper model: tiny/base/small/medium/large"
         required: false
         default: "small"
       tts_voice:
-        description: "edge-tts voice"
+        description: "edge-tts voice (e.g., en-US-JennyNeural)"
         required: false
         default: "en-US-JennyNeural"
+      retention_days:
+        description: "Artifact retention days (1-90)"
+        required: false
+        default: "7"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dub-en-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   dub:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - name: Setup Node (yt-dlp JS runtime)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install yt-dlp openai-whisper edge-tts
 
-      - name: Run pipeline
+      - name: Prepare workspace
+        run: |
+          rm -rf out
+          mkdir -p out
+
+      - name: Write cookies.txt (optional)
+        shell: bash
+        env:
+          YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          content = os.environ.get("YTDLP_COOKIES", "")
+          if content.strip():
+            pathlib.Path("cookies.txt").write_text(content, encoding="utf-8", newline="\n")
+            print("cookies.txt written")
+          else:
+            print("No cookies secret provided; skipping cookies.txt")
+          PY
+
+      - name: Download video
+        shell: bash
         env:
           VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -f cookies.txt ]; then
+            EXTRA_ARGS+=(--cookies cookies.txt)
+          fi
+
+          # Enable JS runtime for YouTube extraction
+          EXTRA_ARGS+=(--js-runtimes node)
+
+          yt-dlp \
+            "${EXTRA_ARGS[@]}" \
+            --no-playlist \
+            -f "bv*+ba/b" \
+            --merge-output-format mp4 \
+            -o "out/input.%(ext)s" \
+            "$VIDEO_URL"
+
+          ls -lah out
+
+      - name: Extract audio (16k mono wav)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
+          echo "Video: $VIDEO_FILE"
+          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/audio.wav
+
+      - name: Whisper transcribe+translate to English (txt)
+        shell: bash
+        env:
           WHISPER_MODEL: ${{ inputs.whisper_model }}
+        run: |
+          set -euo pipefail
+          whisper out/audio.wav \
+            --model "$WHISPER_MODEL" \
+            --task translate \
+            --language Chinese \
+            --output_dir out \
+            --output_format txt
+
+          echo "Transcript:"
+          wc -c out/audio.txt || true
+
+      - name: TTS English dubbing (edge-tts -> mp3)
+        shell: bash
+        env:
           TTS_VOICE: ${{ inputs.tts_voice }}
         run: |
-          bash scripts/run.sh
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio, pathlib, os
+          import edge_tts
+
+          voice = os.environ["TTS_VOICE"]
+          text = pathlib.Path("out/audio.txt").read_text(encoding="utf-8").strip()
+          if not text:
+            raise SystemExit("Empty transcript; aborting")
+
+          async def run():
+            communicate = edge_tts.Communicate(text=text, voice=voice)
+            await communicate.save("out/en.mp3")
+
+          asyncio.run(run())
+          print("Generated out/en.mp3")
+          PY
+
+      - name: Mux English audio into video (output_en.mp4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
+
+          ffmpeg -y \
+            -i "$VIDEO_FILE" -i out/en.mp3 \
+            -map 0:v:0 -map 1:a:0 \
+            -c:v copy -c:a aac -shortest \
+            out/output_en.mp4
+
+      - name: Also export English audio as WAV
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -y -i out/en.mp3 out/en.wav
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: en-dubbed-output
           path: out/
-          retention-days: 7
+          retention-days: ${{ inputs.retention_days }}
