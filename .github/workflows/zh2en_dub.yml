@@ -56,10 +56,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Python deps
+      - name: Install Python deps (pin transformers for XTTS)
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install yt-dlp yt-dlp-ejs openai-whisper TTS
+
+          # IMPORTANT: pin transformers==4.40.2 (XTTS expects BeamSearchScorer)
+          pip install --no-cache-dir \
+            yt-dlp yt-dlp-ejs openai-whisper TTS \
+            "transformers==4.40.2"
+
+          python - <<'PY'
+          import transformers
+          from transformers import BeamSearchScorer
+          print("transformers =", transformers.__version__)
+          print("BeamSearchScorer import OK")
+          PY
 
       - name: Prepare workspace
         shell: bash
@@ -68,7 +81,7 @@ jobs:
           rm -rf out
           mkdir -p out
 
-      - name: Set TTS_HOME (Coqui cache dir)
+      - name: Set TTS_HOME (Coqui cache dir) + non-interactive CPML agree
         shell: bash
         run: |
           set -euo pipefail
@@ -103,7 +116,6 @@ jobs:
           EXTRA_ARGS+=(--js-runtimes node)
           EXTRA_ARGS+=(--remote-components ejs:github)
 
-          # Prefer H.264 (avc1) MP4 when available for compatibility
           FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
           yt-dlp \
