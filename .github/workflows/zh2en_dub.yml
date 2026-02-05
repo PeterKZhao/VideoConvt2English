@@ -56,22 +56,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Python deps (pin transformers for XTTS)
+      - name: Install Python deps (pin torch + transformers)
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
 
-          # IMPORTANT: pin transformers==4.40.2 (XTTS expects BeamSearchScorer)
+          # Pin to avoid:
+          # - transformers API breaks (BeamSearchScorer)
+          # - torch 2.6+ weights_only behavior breaking XTTS checkpoint load
           pip install --no-cache-dir \
-            yt-dlp yt-dlp-ejs openai-whisper TTS \
-            "transformers==4.40.2"
+            "torch==2.5.1" "torchaudio==2.5.1" \
+            "transformers==4.40.2" \
+            yt-dlp yt-dlp-ejs openai-whisper TTS
 
           python - <<'PY'
-          import transformers
-          from transformers import BeamSearchScorer
+          import torch, transformers
+          print("torch =", torch.__version__)
           print("transformers =", transformers.__version__)
-          print("BeamSearchScorer import OK")
           PY
 
       - name: Prepare workspace
@@ -81,7 +83,7 @@ jobs:
           rm -rf out
           mkdir -p out
 
-      - name: Set TTS_HOME (Coqui cache dir) + non-interactive CPML agree
+      - name: Set TTS_HOME + non-interactive CPML agree
         shell: bash
         run: |
           set -euo pipefail
@@ -156,48 +158,29 @@ jobs:
             --language Chinese \
             --output_dir out \
             --output_format txt
-
           test -s out/_whisper.txt
 
-      - name: XTTS v2 voice-clone English audio (wav) with retry
+      - name: XTTS v2 voice-clone English audio (wav)
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, shutil, time
           from pathlib import Path
+          from TTS.api import TTS
 
           text = Path("out/_whisper.txt").read_text(encoding="utf-8").strip()
           if not text:
               raise SystemExit("Empty transcript")
 
-          tts_home = os.environ.get("TTS_HOME")
-          if not tts_home:
-              raise SystemExit("TTS_HOME not set")
-
-          def wipe_cache():
-              shutil.rmtree(tts_home, ignore_errors=True)
-
-          for attempt in (1, 2):
-              try:
-                  from TTS.api import TTS
-                  tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
-                  tts.tts_to_file(
-                      text=text,
-                      speaker_wav="out/_ref.wav",
-                      language="en",
-                      file_path="out/_en_cloned.wav",
-                      split_sentences=True,
-                  )
-                  print("Generated out/_en_cloned.wav")
-                  break
-              except Exception as e:
-                  print(f"XTTS failed on attempt {attempt}: {type(e).__name__}: {e}")
-                  if attempt == 2:
-                      raise
-                  print("Wiping Coqui cache and retrying after 20s...")
-                  wipe_cache()
-                  time.sleep(20)
+          tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+          tts.tts_to_file(
+              text=text,
+              speaker_wav="out/_ref.wav",
+              language="en",
+              file_path="out/_en_cloned.wav",
+              split_sentences=True,
+          )
+          print("Generated out/_en_cloned.wav")
           PY
 
       - name: Mux into MP4 (Windows compatible)
