@@ -9,13 +9,13 @@ on:
       agree_cpml:
         description: "Type 'yes' to agree to Coqui CPML (non-commercial only)"
         required: true
-        default: "yes"
+        default: "no"
       whisper_model:
         description: "Whisper model: tiny/base/small/medium/large"
         required: false
         default: "small"
       tts_ref_seconds:
-        description: "Seconds used as voice reference (>=6 recommended)"
+        description: "Seconds used as voice reference (>=10 recommended)"
         required: false
         default: "15"
       retention_days:
@@ -31,13 +31,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
+    # Make Coqui cache controllable + non-interactive TOS acceptance (you still gate it with agree_cpml)
+    env:
+      COQUI_TOS_AGREED: "1"
+      TTS_HOME: ${{ runner.temp }}/coqui-tts-home
+
     steps:
       - name: Check CPML agreement
         shell: bash
         run: |
           set -euo pipefail
           if [ "${{ inputs.agree_cpml }}" != "yes" ]; then
-            echo "You must set agree_cpml=yes to proceed. CPML is non-commercial only: https://coqui.ai/cpml"
+            echo "You must set agree_cpml=yes to proceed. CPML is non-commercial only: https://coqui.ai/cpml.txt"
             exit 1
           fi
 
@@ -94,7 +99,7 @@ jobs:
           EXTRA_ARGS+=(--js-runtimes node)
           EXTRA_ARGS+=(--remote-components ejs:github)
 
-          # Prefer H.264 (avc1) MP4 when available for maximum compatibility
+          # Prefer H.264 (avc1) MP4 when available for compatibility
           FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
           yt-dlp \
@@ -138,30 +143,45 @@ jobs:
 
           test -s out/_whisper.txt
 
-      - name: XTTS v2 voice-clone English audio (wav)
+      - name: XTTS v2 voice-clone English audio (wav) with retry
         shell: bash
-        env:
-          # Non-interactive acceptance for CI (only after you set agree_cpml=yes)
-          COQUI_TOS_AGREED: "1"
         run: |
           set -euo pipefail
           python - <<'PY'
+          import os, shutil, time
           from pathlib import Path
-          from TTS.api import TTS
 
           text = Path("out/_whisper.txt").read_text(encoding="utf-8").strip()
           if not text:
               raise SystemExit("Empty transcript")
 
-          tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
-          tts.tts_to_file(
-              text=text,
-              speaker_wav="out/_ref.wav",
-              language="en",
-              file_path="out/_en_cloned.wav",
-              split_sentences=True,
-          )
-          print("Generated out/_en_cloned.wav")
+          tts_home = os.environ.get("TTS_HOME")
+          assert tts_home, "TTS_HOME not set"
+
+          def wipe_cache():
+              # wipe whole cache to recover from corrupted downloads (e.g., HTML/empty config.json)
+              shutil.rmtree(tts_home, ignore_errors=True)
+
+          for attempt in (1, 2):
+              try:
+                  from TTS.api import TTS
+                  tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+                  tts.tts_to_file(
+                      text=text,
+                      speaker_wav="out/_ref.wav",
+                      language="en",
+                      file_path="out/_en_cloned.wav",
+                      split_sentences=True,
+                  )
+                  print("Generated out/_en_cloned.wav")
+                  break
+              except Exception as e:
+                  print(f"XTTS failed on attempt {attempt}: {type(e).__name__}: {e}")
+                  if attempt == 2:
+                      raise
+                  print("Wiping Coqui cache and retrying after 20s...")
+                  wipe_cache()
+                  time.sleep(20)
           PY
 
       - name: Mux into MP4 (Windows compatible)
