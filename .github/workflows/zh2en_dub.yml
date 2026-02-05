@@ -6,6 +6,10 @@ on:
       video_url:
         description: "Video URL to download (e.g., YouTube)"
         required: true
+      agree_cpml:
+        description: "Type 'yes' to agree to Coqui CPML (non-commercial only)"
+        required: true
+        default: "no"
       whisper_model:
         description: "Whisper model: tiny/base/small/medium/large"
         required: false
@@ -13,11 +17,7 @@ on:
       tts_ref_seconds:
         description: "Seconds used as voice reference (>=6 recommended)"
         required: false
-        default: "12"
-      tts_voice_clone_lang:
-        description: "Target language for cloned speech"
-        required: false
-        default: "en"
+        default: "15"
       retention_days:
         description: "Artifact retention days (1-90)"
         required: false
@@ -32,8 +32,14 @@ jobs:
     timeout-minutes: 240
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Check CPML agreement
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.agree_cpml }}" != "yes" ]; then
+            echo "You must set agree_cpml=yes to proceed. CPML is non-commercial only: https://coqui.ai/cpml"
+            exit 1
+          fi
 
       - name: Setup Node (yt-dlp JS runtime)
         uses: actions/setup-node@v4
@@ -53,7 +59,6 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # yt-dlp + ejs for YouTube, whisper for translate, TTS for XTTS v2 voice cloning
           pip install yt-dlp yt-dlp-ejs openai-whisper TTS
 
       - name: Prepare workspace
@@ -89,7 +94,7 @@ jobs:
           EXTRA_ARGS+=(--js-runtimes node)
           EXTRA_ARGS+=(--remote-components ejs:github)
 
-          # Prefer H.264 in MP4 when available, fallback to best MP4
+          # Prefer H.264 (avc1) MP4 when available for maximum compatibility
           FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
           yt-dlp \
@@ -102,12 +107,12 @@ jobs:
 
           ls -lah out
 
-      - name: Extract full audio for Whisper (16k mono wav)
+      - name: Extract audio for Whisper (16k mono wav)
         shell: bash
         run: |
           set -euo pipefail
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/audio_whisper.wav
+          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/_whisper.wav
 
       - name: Make voice reference wav (for cloning)
         shell: bash
@@ -116,8 +121,7 @@ jobs:
         run: |
           set -euo pipefail
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          # Take a short slice after 1s to avoid leading silence; 24kHz mono is fine for XTTS
-          ffmpeg -y -ss 1 -t "$REF_SEC" -i "$VIDEO_FILE" -vn -ac 1 -ar 24000 -c:a pcm_s16le out/ref.wav
+          ffmpeg -y -ss 1 -t "$REF_SEC" -i "$VIDEO_FILE" -vn -ac 1 -ar 24000 -c:a pcm_s16le out/_ref.wav
 
       - name: Whisper translate to English text (txt)
         shell: bash
@@ -125,52 +129,49 @@ jobs:
           WHISPER_MODEL: ${{ inputs.whisper_model }}
         run: |
           set -euo pipefail
-          whisper out/audio_whisper.wav \
+          whisper out/_whisper.wav \
             --model "$WHISPER_MODEL" \
             --task translate \
             --language Chinese \
             --output_dir out \
             --output_format txt
 
-          test -s out/audio_whisper.txt
+          test -s out/_whisper.txt
 
       - name: XTTS v2 voice-clone English audio (wav)
         shell: bash
         env:
-          TARGET_LANG: ${{ inputs.tts_voice_clone_lang }}
+          # Non-interactive acceptance for CI (only after you set agree_cpml=yes)
+          COQUI_TOS_AGREED: "1"
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os
           from pathlib import Path
           from TTS.api import TTS
 
-          text = Path("out/audio_whisper.txt").read_text(encoding="utf-8").strip()
+          text = Path("out/_whisper.txt").read_text(encoding="utf-8").strip()
           if not text:
               raise SystemExit("Empty transcript")
 
-          # XTTS v2: cross-language voice cloning via speaker_wav
           tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
-
           tts.tts_to_file(
               text=text,
-              speaker_wav="out/ref.wav",
-              language=os.environ.get("TARGET_LANG", "en"),
-              file_path="out/en_cloned.wav",
+              speaker_wav="out/_ref.wav",
+              language="en",
+              file_path="out/_en_cloned.wav",
               split_sentences=True,
           )
-          print("Generated out/en_cloned.wav")
+          print("Generated out/_en_cloned.wav")
           PY
 
-      - name: Mux back into MP4 (Windows compatible)
+      - name: Mux into MP4 (Windows compatible)
         shell: bash
         run: |
           set -euo pipefail
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
 
-          # Always re-encode video to H.264 for Windows stock player compatibility
           ffmpeg -y \
-            -i "$VIDEO_FILE" -i out/en_cloned.wav \
+            -i "$VIDEO_FILE" -i out/_en_cloned.wav \
             -map 0:v:0 -map 1:a:0 \
             -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
             -c:a aac -b:a 192k \
@@ -181,16 +182,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Normalize original name to input.mp4 (in case it isn't)
           IN="$(ls -1 out/input.* | head -n 1)"
           if [ "$IN" != "out/input.mp4" ]; then
             mv "$IN" out/input.mp4
           fi
-          # Remove everything else
           find out -type f ! -name "input.mp4" ! -name "output_en.mp4" -delete
           ls -lah out
 
-      - name: Upload artifact (only the two videos)
+      - name: Upload artifact (only 2 videos)
         uses: actions/upload-artifact@v4
         with:
           name: en-dubbed-output
