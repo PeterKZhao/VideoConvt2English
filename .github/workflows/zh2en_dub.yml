@@ -9,7 +9,7 @@ on:
       agree_cpml:
         description: "Type 'yes' to agree to Coqui CPML (non-commercial only)"
         required: true
-        default: "no"
+        default: "yes"
       whisper_model:
         description: "Whisper model: tiny/base/small/medium/large"
         required: false
