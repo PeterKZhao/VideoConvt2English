@@ -17,7 +17,7 @@ on:
       tts_ref_seconds:
         description: "Seconds used as voice reference (>=10 recommended)"
         required: false
-        default: "15"
+        default: "60"
       retention_days:
         description: "Artifact retention days (1-90)"
         required: false
