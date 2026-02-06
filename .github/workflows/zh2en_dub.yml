@@ -17,7 +17,11 @@ on:
       tts_ref_seconds:
         description: "Seconds used as voice reference (>=10 recommended)"
         required: false
-        default: "60"
+        default: "30"
+      burn_subs:
+        description: "Burn English subtitles into video? yes/no (default: no, means soft-subs embedded)"
+        required: false
+        default: "no"
       retention_days:
         description: "Artifact retention days (1-90)"
         required: false
@@ -156,6 +160,67 @@ jobs:
           mv -f "$VID" out/input.mp4
           echo "Normalized video to out/input.mp4"
           ls -lah out
+
+      - name: Extract embedded subtitle track (best-effort, if no SRT sidecar)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, subprocess, pathlib
+
+          out_dir = pathlib.Path("out")
+          existing = sorted(out_dir.glob("input*.srt"))
+          if existing:
+              print("SRT sidecars already present:", [p.name for p in existing])
+              raise SystemExit(0)
+
+          # Probe subtitle streams (if any)
+          cmd = [
+              "ffprobe", "-v", "error",
+              "-select_streams", "s",
+              "-show_entries", "stream_tags=language",
+              "-of", "json",
+              "out/input.mp4",
+          ]
+          p = subprocess.run(cmd, capture_output=True, text=True)
+          if p.returncode != 0:
+              print("ffprobe failed; skipping embedded subtitle extraction")
+              raise SystemExit(0)
+
+          data = json.loads(p.stdout or "{}")
+          streams = data.get("streams", []) or []
+          if not streams:
+              print("No embedded subtitle streams found.")
+              raise SystemExit(0)
+
+          def score(stream):
+              lang = ((stream.get("tags") or {}).get("language") or "").lower()
+              if lang.startswith("zh"): return 0
+              if lang.startswith("en"): return 1
+              return 2
+
+          best_i = sorted(range(len(streams)), key=lambda i: score(streams[i]))[0]
+          best_lang = (((streams[best_i].get("tags") or {}).get("language")) or "und").lower()
+          lang_slug = "zh" if best_lang.startswith("zh") else ("en" if best_lang.startswith("en") else "emb")
+          out_srt = out_dir / f"input.{lang_slug}.srt"
+
+          # Try to convert that subtitle stream to SRT (may fail for image-based subs like PGS)
+          cmd2 = [
+              "ffmpeg", "-y",
+              "-i", "out/input.mp4",
+              "-map", f"0:s:{best_i}",
+              "-c:s", "srt",
+              str(out_srt),
+          ]
+          p2 = subprocess.run(cmd2, capture_output=True, text=True)
+
+          if p2.returncode != 0 or (not out_srt.exists()) or out_srt.stat().st_size == 0:
+              if out_srt.exists():
+                  out_srt.unlink()
+              print("Embedded subtitle extraction failed (possibly image-based subtitles).")
+          else:
+              print("Extracted embedded subtitles to", out_srt.name)
+          PY
 
       - name: Detect downloaded subtitles and make transcripts (prefer existing)
         id: detect_subs
@@ -300,6 +365,13 @@ jobs:
           cp out/_whisper_en/_whisper.srt out/sub_en.srt
           cp out/_whisper_en/_whisper.txt out/transcript_en.txt
 
+      - name: Ensure English subtitle exists (sanity check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/sub_en.srt
+          test -s out/transcript_en.txt
+
       - name: XTTS v2 voice-clone English audio (wav)
         shell: bash
         run: |
@@ -323,18 +395,36 @@ jobs:
           print("Generated out/_en_cloned.wav")
           PY
 
-      - name: Mux into MP4 (Windows compatible)
+      - name: Mux into MP4 (English audio + English subtitles)
         shell: bash
+        env:
+          BURN_SUBS: ${{ inputs.burn_subs }}
         run: |
           set -euo pipefail
 
-          ffmpeg -y \
-            -i out/input.mp4 -i out/_en_cloned.wav \
-            -map 0:v:0 -map 1:a:0 \
-            -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
-            -c:a aac -b:a 192k \
-            -shortest -movflags +faststart \
-            out/output_en.mp4
+          if [ "$BURN_SUBS" = "yes" ]; then
+            # Burn subtitles into the video frames (hard-sub)
+            ffmpeg -y \
+              -i out/input.mp4 -i out/_en_cloned.wav \
+              -vf "subtitles=out/sub_en.srt" \
+              -map 0:v:0 -map 1:a:0 \
+              -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+              -c:a aac -b:a 192k \
+              -shortest -movflags +faststart \
+              out/output_en.mp4
+          else
+            # Embed subtitles as a selectable track in MP4 (soft-sub).
+            # Note: MP4 typically uses mov_text for subtitles.
+            ffmpeg -y \
+              -i out/input.mp4 -i out/_en_cloned.wav \
+              -sub_charenc UTF-8 -i out/sub_en.srt \
+              -map 0:v:0 -map 1:a:0 -map 2:0 \
+              -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+              -c:a aac -b:a 192k \
+              -c:s mov_text -metadata:s:s:0 language=eng \
+              -shortest -movflags +faststart \
+              out/output_en.mp4
+          fi
 
           test -s out/output_en.mp4
 
