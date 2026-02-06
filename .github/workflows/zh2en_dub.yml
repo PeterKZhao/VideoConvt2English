@@ -105,7 +105,7 @@ jobs:
             print("No cookies secret provided; skipping cookies.txt")
           PY
 
-      - name: Download video (yt-dlp)
+      - name: Download video + subtitles if available (yt-dlp)
         shell: bash
         env:
           VIDEO_URL: ${{ inputs.video_url }}
@@ -120,17 +120,110 @@ jobs:
 
           FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
+          # Try to download creator subs first, fallback to auto-subs if none exist.
+          # Convert to srt when possible (requires ffmpeg, already installed).
           yt-dlp \
             "${EXTRA_ARGS[@]}" \
             --no-playlist \
             -f "$FORMAT_SELECTOR" \
             --merge-output-format mp4 \
             -o "out/input.%(ext)s" \
+            --write-subs \
+            --write-auto-subs \
+            --sub-langs "zh.*,en.*" \
+            --sub-format "vtt/ttml/best" \
+            --convert-subs srt \
             "$VIDEO_URL"
 
           ls -lah out
 
-      - name: Extract audio for Whisper (16k mono wav)
+      - name: Detect downloaded subtitles and make transcripts (prefer existing)
+        id: detect_subs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, re, glob, pathlib
+
+          out_dir = pathlib.Path("out")
+          srt_files = sorted(out_dir.glob("input*.srt"))
+
+          def pick_lang(files, prefixes):
+              # prefixes like ["zh", "zh-Hans", ...] or ["en", "en-US", ...]
+              scored = []
+              for p in files:
+                  name = p.name.lower()
+                  # Try to extract language-like token from filename: input.<lang>....srt
+                  # We still do fuzzy prefix matching to survive yt-dlp language ids.
+                  for i, pref in enumerate(prefixes):
+                      pref = pref.lower()
+                      # match ".<pref>" somewhere after "input"
+                      if re.search(rf"\.{re.escape(pref)}([.\-]|$)", name):
+                          scored.append((i, len(name), p))
+                          break
+              if not scored:
+                  # fallback: any file starting with input.<prefix> loosely
+                  for p in files:
+                      name = p.name.lower()
+                      for i, pref in enumerate(prefixes):
+                          pref = pref.lower()
+                          if f".{pref}" in name:
+                              scored.append((i, len(name), p))
+                              break
+              if not scored:
+                  return None
+              scored.sort()
+              return scored[0][2]
+
+          def srt_to_text(srt_path: pathlib.Path) -> str:
+              text_lines = []
+              for raw in srt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                  line = raw.strip()
+                  if not line:
+                      continue
+                  if re.fullmatch(r"\d+", line):
+                      continue
+                  if "-->" in line:
+                      continue
+                  line = re.sub(r"<[^>]+>", "", line)  # remove simple HTML tags
+                  line = line.strip()
+                  if line:
+                      text_lines.append(line)
+              return "\n".join(text_lines).strip()
+
+          zh_prefixes = ["zh-hans", "zh-cn", "zh", "zh-hant", "zh-tw", "cmn"]
+          en_prefixes = ["en-us", "en-gb", "en", "eng"]
+
+          zh_srt = pick_lang(srt_files, zh_prefixes)
+          en_srt = pick_lang(srt_files, en_prefixes)
+
+          have_zh = False
+          have_en = False
+
+          if zh_srt and zh_srt.exists() and zh_srt.stat().st_size > 0:
+              (out_dir / "sub_zh.srt").write_text(zh_srt.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+              (out_dir / "transcript_zh.txt").write_text(srt_to_text(zh_srt), encoding="utf-8")
+              have_zh = True
+
+          if en_srt and en_srt.exists() and en_srt.stat().st_size > 0:
+              (out_dir / "sub_en.srt").write_text(en_srt.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+              (out_dir / "transcript_en.txt").write_text(srt_to_text(en_srt), encoding="utf-8")
+              have_en = True
+
+          # Export step outputs
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as f:
+                  f.write(f"have_zh={'true' if have_zh else 'false'}\n")
+                  f.write(f"have_en={'true' if have_en else 'false'}\n")
+
+          print("Found SRTs:", [p.name for p in srt_files])
+          print("have_zh =", have_zh, "picked:", zh_srt.name if zh_srt else None)
+          print("have_en =", have_en, "picked:", en_srt.name if en_srt else None)
+          PY
+
+      - name: Extract audio for Whisper (16k mono wav) [only if needed]
+        if: steps.detect_subs.outputs.have_zh != 'true' || steps.detect_subs.outputs.have_en != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -146,19 +239,53 @@ jobs:
           VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
           ffmpeg -y -ss 1 -t "$REF_SEC" -i "$VIDEO_FILE" -vn -ac 1 -ar 24000 -c:a pcm_s16le out/_ref.wav
 
-      - name: Whisper translate to English text (txt)
+      - name: Whisper transcribe Chinese (fallback)
+        if: steps.detect_subs.outputs.have_zh != 'true'
         shell: bash
         env:
           WHISPER_MODEL: ${{ inputs.whisper_model }}
         run: |
           set -euo pipefail
+
+          rm -rf out/_whisper_zh
+          mkdir -p out/_whisper_zh
+
+          whisper out/_whisper.wav \
+            --model "$WHISPER_MODEL" \
+            --task transcribe \
+            --language Chinese \
+            --output_dir out/_whisper_zh \
+            --output_format all \
+            --fp16 False
+
+          test -s out/_whisper_zh/_whisper.srt
+          test -s out/_whisper_zh/_whisper.txt
+          cp out/_whisper_zh/_whisper.srt out/sub_zh.srt
+          cp out/_whisper_zh/_whisper.txt out/transcript_zh.txt
+
+      - name: Whisper translate to English (fallback)
+        if: steps.detect_subs.outputs.have_en != 'true'
+        shell: bash
+        env:
+          WHISPER_MODEL: ${{ inputs.whisper_model }}
+        run: |
+          set -euo pipefail
+
+          rm -rf out/_whisper_en
+          mkdir -p out/_whisper_en
+
           whisper out/_whisper.wav \
             --model "$WHISPER_MODEL" \
             --task translate \
             --language Chinese \
-            --output_dir out \
-            --output_format txt
-          test -s out/_whisper.txt
+            --output_dir out/_whisper_en \
+            --output_format all \
+            --fp16 False
+
+          test -s out/_whisper_en/_whisper.srt
+          test -s out/_whisper_en/_whisper.txt
+          cp out/_whisper_en/_whisper.srt out/sub_en.srt
+          cp out/_whisper_en/_whisper.txt out/transcript_en.txt
 
       - name: XTTS v2 voice-clone English audio (wav)
         shell: bash
@@ -168,9 +295,9 @@ jobs:
           from pathlib import Path
           from TTS.api import TTS
 
-          text = Path("out/_whisper.txt").read_text(encoding="utf-8").strip()
+          text = Path("out/transcript_en.txt").read_text(encoding="utf-8").strip()
           if not text:
-              raise SystemExit("Empty transcript")
+              raise SystemExit("Empty English transcript")
 
           tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
           tts.tts_to_file(
@@ -197,7 +324,7 @@ jobs:
             -shortest -movflags +faststart \
             out/output_en.mp4
 
-      - name: Cleanup (keep only input.mp4 and output_en.mp4)
+      - name: Cleanup (keep videos + subtitles + transcripts)
         shell: bash
         run: |
           set -euo pipefail
@@ -205,14 +332,31 @@ jobs:
           if [ "$IN" != "out/input.mp4" ]; then
             mv "$IN" out/input.mp4
           fi
-          find out -type f ! -name "input.mp4" ! -name "output_en.mp4" -delete
+
+          # Keep:
+          # - input.mp4, output_en.mp4
+          # - sub_zh.srt, sub_en.srt
+          # - transcript_zh.txt, transcript_en.txt
+          find out -type f \
+            ! -name "input.mp4" \
+            ! -name "output_en.mp4" \
+            ! -name "sub_zh.srt" \
+            ! -name "sub_en.srt" \
+            ! -name "transcript_zh.txt" \
+            ! -name "transcript_en.txt" \
+            -delete
+
           ls -lah out
 
-      - name: Upload artifact (only 2 videos)
+      - name: Upload artifact (videos + subtitles + transcripts)
         uses: actions/upload-artifact@v4
         with:
           name: en-dubbed-output
           path: |
             out/input.mp4
             out/output_en.mp4
+            out/sub_zh.srt
+            out/sub_en.srt
+            out/transcript_zh.txt
+            out/transcript_en.txt
           retention-days: ${{ inputs.retention_days }}
