@@ -120,8 +120,6 @@ jobs:
 
           FORMAT_SELECTOR='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best'
 
-          # Try to download creator subs first, fallback to auto-subs if none exist.
-          # Convert to srt when possible (requires ffmpeg, already installed).
           yt-dlp \
             "${EXTRA_ARGS[@]}" \
             --no-playlist \
@@ -137,32 +135,49 @@ jobs:
 
           ls -lah out
 
+      - name: Normalize video filename to out/input.mp4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -s out/input.mp4 ]; then
+            echo "Found out/input.mp4"
+            exit 0
+          fi
+
+          # Find first likely video file; avoid subtitles / text sidecars.
+          VID="$(ls -1 out/input.* 2>/dev/null | grep -E '\.(mp4|mkv|webm|mov)$' | head -n 1 || true)"
+          if [ -z "${VID}" ]; then
+            echo "ERROR: Cannot find downloaded video (out/input.* with video extension)."
+            ls -lah out
+            exit 1
+          fi
+
+          mv -f "$VID" out/input.mp4
+          echo "Normalized video to out/input.mp4"
+          ls -lah out
+
       - name: Detect downloaded subtitles and make transcripts (prefer existing)
         id: detect_subs
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re, glob, pathlib
+          import os, re, pathlib
 
           out_dir = pathlib.Path("out")
           srt_files = sorted(out_dir.glob("input*.srt"))
 
           def pick_lang(files, prefixes):
-              # prefixes like ["zh", "zh-Hans", ...] or ["en", "en-US", ...]
               scored = []
               for p in files:
                   name = p.name.lower()
-                  # Try to extract language-like token from filename: input.<lang>....srt
-                  # We still do fuzzy prefix matching to survive yt-dlp language ids.
                   for i, pref in enumerate(prefixes):
                       pref = pref.lower()
-                      # match ".<pref>" somewhere after "input"
                       if re.search(rf"\.{re.escape(pref)}([.\-]|$)", name):
                           scored.append((i, len(name), p))
                           break
               if not scored:
-                  # fallback: any file starting with input.<prefix> loosely
                   for p in files:
                       name = p.name.lower()
                       for i, pref in enumerate(prefixes):
@@ -185,7 +200,7 @@ jobs:
                       continue
                   if "-->" in line:
                       continue
-                  line = re.sub(r"<[^>]+>", "", line)  # remove simple HTML tags
+                  line = re.sub(r"<[^>]+>", "", line)
                   line = line.strip()
                   if line:
                       text_lines.append(line)
@@ -210,7 +225,6 @@ jobs:
               (out_dir / "transcript_en.txt").write_text(srt_to_text(en_srt), encoding="utf-8")
               have_en = True
 
-          # Export step outputs
           gh_out = os.environ.get("GITHUB_OUTPUT")
           if gh_out:
               with open(gh_out, "a", encoding="utf-8") as f:
@@ -227,8 +241,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/_whisper.wav
+          ffmpeg -y -i out/input.mp4 -vn -ac 1 -ar 16000 -c:a pcm_s16le out/_whisper.wav
 
       - name: Make voice reference wav (for cloning)
         shell: bash
@@ -236,8 +249,8 @@ jobs:
           REF_SEC: ${{ inputs.tts_ref_seconds }}
         run: |
           set -euo pipefail
-          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
-          ffmpeg -y -ss 1 -t "$REF_SEC" -i "$VIDEO_FILE" -vn -ac 1 -ar 24000 -c:a pcm_s16le out/_ref.wav
+          ffmpeg -y -ss 1 -t "$REF_SEC" -i out/input.mp4 -vn -ac 1 -ar 24000 -c:a pcm_s16le out/_ref.wav
+          test -s out/_ref.wav
 
       - name: Whisper transcribe Chinese (fallback)
         if: steps.detect_subs.outputs.have_zh != 'true'
@@ -314,24 +327,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VIDEO_FILE="$(ls -1 out/input.* | head -n 1)"
 
           ffmpeg -y \
-            -i "$VIDEO_FILE" -i out/_en_cloned.wav \
+            -i out/input.mp4 -i out/_en_cloned.wav \
             -map 0:v:0 -map 1:a:0 \
             -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
             -c:a aac -b:a 192k \
             -shortest -movflags +faststart \
             out/output_en.mp4
 
+          test -s out/output_en.mp4
+
       - name: Cleanup (keep videos + subtitles + transcripts)
         shell: bash
         run: |
           set -euo pipefail
-          IN="$(ls -1 out/input.* | head -n 1)"
-          if [ "$IN" != "out/input.mp4" ]; then
-            mv "$IN" out/input.mp4
-          fi
 
           # Keep:
           # - input.mp4, output_en.mp4
