@@ -92,12 +92,14 @@ jobs:
         run: |
           set -euo pipefail
           echo "TTS_HOME=$RUNNER_TEMP/coqui-tts-home" >> "$GITHUB_ENV"
-          echo "COQUI_TOS_AGREED=1" >> "$GITHUB_ENV"
+          echo "COQUI_TOS_AGREED=${COQUI_TOS_AGREED:-1}" >> "$GITHUB_ENV"
+        env:
+          COQUI_TOS_AGREED: ${{ vars.COQUI_TOS_AGREED }}
 
       - name: Write cookies.txt (optional)
         shell: bash
         env:
-          YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
+          YTDLP_COOKIES: ${{ secrets.YOUTUBE_SOURCE_COOKIE_FILE_VIDEO_DUB }}
         run: |
           python - <<'PY'
           import os, pathlib
